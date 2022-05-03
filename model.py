@@ -5,13 +5,6 @@ import torch.nn.functional as F
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 #device = torch.device('cpu')
 
-class Embedding(nn.Module):
-    """
-    Input embedding
-    """
-    def __init__(self):
-        pass
-
 
 class Encoder(nn.Module):
     """Encodes the static & dynamic states using 1d Convolution."""

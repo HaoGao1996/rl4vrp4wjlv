@@ -58,8 +58,6 @@ def reward(static, tour_indices):
     -------
     Euclidean distance between consecutive nodes on the route. of size
     (batch_size, num_cities)
-
-    TODO[wjlv]: add specific reward function here based on pytorch.
     """
 
     # Convert the indices back into a tour

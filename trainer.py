@@ -244,8 +244,8 @@ def train_tsp(args):
     # TSP50, 6.08
     # TSP100, 8.44
 
-    from rl4vrp4wjlv import tsp
-    from rl4vrp4wjlv.tsp import TSPDataset
+    from tasks import tsp
+    from tasks.tsp import TSPDataset
 
     STATIC_SIZE = 2 # (x, y)
     DYNAMIC_SIZE = 1 # dummy for compatibility
