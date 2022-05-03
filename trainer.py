@@ -1,4 +1,5 @@
-"""Defines the main trainer model for combinatorial problems
+"""
+Defines the main trainer model for combinatorial problems
 
 Each task must define the following functions:
 * mask_fn: can be None
@@ -18,73 +19,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from model import DRL4TSP, Encoder
+from model import DRL4TSP, StateCritic
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 #device = torch.device('cpu')
-
-
-class StateCritic(nn.Module):
-    """Estimates the problem complexity.
-
-    This is a basic module that just looks at the log-probabilities predicted by
-    the encoder + decoder, and returns an estimate of complexity
-    """
-
-    def __init__(self, static_size, dynamic_size, hidden_size):
-        super(StateCritic, self).__init__()
-
-        self.static_encoder = Encoder(static_size, hidden_size)
-        self.dynamic_encoder = Encoder(dynamic_size, hidden_size)
-
-        # Define the encoder & decoder models
-        self.fc1 = nn.Conv1d(hidden_size * 2, 20, kernel_size=1)
-        self.fc2 = nn.Conv1d(20, 20, kernel_size=1)
-        self.fc3 = nn.Conv1d(20, 1, kernel_size=1)
-
-        for p in self.parameters():
-            if len(p.shape) > 1:
-                nn.init.xavier_uniform_(p)
-
-    def forward(self, static, dynamic):
-
-        # Use the probabilities of visiting each
-        static_hidden = self.static_encoder(static)
-        dynamic_hidden = self.dynamic_encoder(dynamic)
-
-        hidden = torch.cat((static_hidden, dynamic_hidden), 1)
-
-        output = F.relu(self.fc1(hidden))
-        output = F.relu(self.fc2(output))
-        output = self.fc3(output).sum(dim=2)
-        return output
-
-
-class Critic(nn.Module):
-    """Estimates the problem complexity.
-
-    This is a basic module that just looks at the log-probabilities predicted by
-    the encoder + decoder, and returns an estimate of complexity
-    """
-
-    def __init__(self, hidden_size):
-        super(Critic, self).__init__()
-
-        # Define the encoder & decoder models
-        self.fc1 = nn.Conv1d(1, hidden_size, kernel_size=1)
-        self.fc2 = nn.Conv1d(hidden_size, 20, kernel_size=1)
-        self.fc3 = nn.Conv1d(20, 1, kernel_size=1)
-
-        for p in self.parameters():
-            if len(p.shape) > 1:
-                nn.init.xavier_uniform_(p)
-
-    def forward(self, input):
-
-        output = F.relu(self.fc1(input.unsqueeze(1)))
-        output = F.relu(self.fc2(output)).squeeze(2)
-        output = self.fc3(output).sum(dim=2)
-        return output
 
 
 def validate(data_loader, actor, reward_fn, render_fn=None, save_dir='.',
@@ -121,7 +59,7 @@ def validate(data_loader, actor, reward_fn, render_fn=None, save_dir='.',
 
 
 def train(actor, critic, task, num_nodes, train_data, valid_data, reward_fn,
-          render_fn, batch_size, actor_lr, critic_lr, max_grad_norm,
+          render_fn, batch_size, actor_lr, critic_lr, max_grad_norm, agg_matrix,
           **kwargs):
     """Constructs the main actor & critic networks, and performs all training."""
 
@@ -161,13 +99,13 @@ def train(actor, critic, task, num_nodes, train_data, valid_data, reward_fn,
             x0 = x0.to(device) if len(x0) > 0 else None
 
             # Full forward pass through the dataset
-            tour_indices, tour_logp = actor(static, dynamic, x0)
+            tour_indices, tour_logp = actor(static, dynamic, agg_matrix, x0)
 
             # Sum the log probabilities for each city in the tour
             reward = reward_fn(static, tour_indices)
 
             # Query the critic for an estimate of the reward
-            critic_est = critic(static, dynamic).view(-1)
+            critic_est = critic(static, dynamic, agg_matrix).view(-1)
 
             advantage = (reward - critic_est)
             actor_loss = torch.mean(advantage.detach() * tour_logp.sum(dim=1))
@@ -236,40 +174,35 @@ def train(actor, critic, task, num_nodes, train_data, valid_data, reward_fn,
               np.mean(times)))
 
 
-
 def train_tsp(args):
-
-    # Goals from paper:
-    # TSP20, 3.97
-    # TSP50, 6.08
-    # TSP100, 8.44
-
     from tasks import tsp
     from tasks.tsp import TSPDataset
 
-    STATIC_SIZE = 2 # (x, y)
-    DYNAMIC_SIZE = 1 # dummy for compatibility
-
-    train_data = TSPDataset(args.num_nodes, args.train_size, args.seed)
-    valid_data = TSPDataset(args.num_nodes, args.valid_size, args.seed + 1)
+    train_data = TSPDataset(args.train_file_name)
+    valid_data = TSPDataset(args.valid_file_name)  # todo: need another data
 
     update_fn = None
 
-    actor = DRL4TSP(STATIC_SIZE,
-                    DYNAMIC_SIZE,
+    actor = DRL4TSP(train_data.static_size,
+                    train_data.dynamic_size,
                     args.hidden_size,
                     update_fn,
                     tsp.update_mask,
                     args.num_layers,
                     args.dropout).to(device)
 
-    critic = StateCritic(STATIC_SIZE, DYNAMIC_SIZE, args.hidden_size).to(device)
+    critic = StateCritic(train_data.static_size,
+                         train_data.dynamic_size,
+                         args.hidden_size).to(device)
 
     kwargs = vars(args)
+    kwargs['task'] = 'tsp'
+    kwargs['num_nodes'] = train_data.num_nodes
     kwargs['train_data'] = train_data
     kwargs['valid_data'] = valid_data
     kwargs['reward_fn'] = tsp.reward
     kwargs['render_fn'] = tsp.render
+    kwargs['agg_matrix'] = train_data.agg_matrix
 
     if args.checkpoint:
         path = os.path.join(args.checkpoint, 'actor.pt')
@@ -281,112 +214,31 @@ def train_tsp(args):
     if not args.test:
         train(actor, critic, **kwargs)
 
-    test_data = TSPDataset(args.num_nodes, args.train_size, args.seed + 2)
-
-    test_dir = 'test'
-    test_loader = DataLoader(test_data, args.batch_size, False, num_workers=0)
-    out = validate(test_loader, actor, tsp.reward, tsp.render, test_dir, num_plot=5)
-
-    print('Average tour length: ', out)
-
-
-def train_vrp(args):
-
-    # Goals from paper:
-    # VRP10, Capacity 20:  4.84  (Greedy)
-    # VRP20, Capacity 30:  6.59  (Greedy)
-    # VRP50, Capacity 40:  11.39 (Greedy)
-    # VRP100, Capacity 50: 17.23  (Greedy)
-
-    from tasks import vrp
-    from tasks.vrp import VehicleRoutingDataset
-
-    # Determines the maximum amount of load for a vehicle based on num nodes
-    LOAD_DICT = {10: 20, 20: 30, 50: 40, 100: 50}
-    MAX_DEMAND = 9
-    STATIC_SIZE = 2 # (x, y)
-    DYNAMIC_SIZE = 2 # (load, demand)
-
-    max_load = LOAD_DICT[args.num_nodes]
-
-    train_data = VehicleRoutingDataset(args.train_size,
-                                       args.num_nodes,
-                                       max_load,
-                                       MAX_DEMAND,
-                                       args.seed)
-
-    valid_data = VehicleRoutingDataset(args.valid_size,
-                                       args.num_nodes,
-                                       max_load,
-                                       MAX_DEMAND,
-                                       args.seed + 1)
-
-    actor = DRL4TSP(STATIC_SIZE,
-                    DYNAMIC_SIZE,
-                    args.hidden_size,
-                    train_data.update_dynamic,
-                    train_data.update_mask,
-                    args.num_layers,
-                    args.dropout).to(device)
-
-    critic = StateCritic(STATIC_SIZE, DYNAMIC_SIZE, args.hidden_size).to(device)
-
-    kwargs = vars(args)
-    kwargs['train_data'] = train_data
-    kwargs['valid_data'] = valid_data
-    kwargs['reward_fn'] = vrp.reward
-    kwargs['render_fn'] = vrp.render
-
-    if args.checkpoint:
-        path = os.path.join(args.checkpoint, 'actor.pt')
-        actor.load_state_dict(torch.load(path, device))
-
-        path = os.path.join(args.checkpoint, 'critic.pt')
-        critic.load_state_dict(torch.load(path, device))
-
-    if not args.test:
-        train(actor, critic, **kwargs)
-
-    test_data = VehicleRoutingDataset(args.valid_size,
-                                      args.num_nodes,
-                                      max_load,
-                                      MAX_DEMAND,
-                                      args.seed + 2)
-
-    test_dir = 'test'
-    test_loader = DataLoader(test_data, args.batch_size, False, num_workers=0)
-    out = validate(test_loader, actor, vrp.reward, vrp.render, test_dir, num_plot=5)
-
-    print('Average tour length: ', out)
+    # todo: rebuild test pipeline
+    # test_data = TSPDataset(args.test_file_name)  # todo: need another data
+    #
+    # test_dir = 'test'
+    # test_loader = DataLoader(test_data, args.batch_size, False, num_workers=0)
+    # out = validate(test_loader, actor, tsp.reward, tsp.render, test_dir, num_plot=5)
+    #
+    # print('Average tour length: ', out)
 
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Combinatorial Optimization')
-    parser.add_argument('--seed', default=12345, type=int)
+    parser.add_argument('--train_file_name', default='./data/data_sample_3000.csv', type=str)
+    parser.add_argument('--valid_file_name', default='./data/data_sample_3000.csv', type=str)
+    parser.add_argument('--test_file_name', default='./data/data_sample_3000.csv', type=str)
     parser.add_argument('--checkpoint', default=None)
     parser.add_argument('--test', action='store_true', default=False)
-    parser.add_argument('--task', default='tsp')
-    parser.add_argument('--nodes', dest='num_nodes', default=20, type=int)
     parser.add_argument('--actor_lr', default=5e-4, type=float)
     parser.add_argument('--critic_lr', default=5e-4, type=float)
     parser.add_argument('--max_grad_norm', default=2., type=float)
-    parser.add_argument('--batch_size', default=256, type=int)
+    parser.add_argument('--batch_size', default=16, type=int)
     parser.add_argument('--hidden', dest='hidden_size', default=128, type=int)
     parser.add_argument('--dropout', default=0.1, type=float)
-    parser.add_argument('--layers', dest='num_layers', default=1, type=int)
-    parser.add_argument('--train-size',default=1000000, type=int)
-    parser.add_argument('--valid-size', default=1000, type=int)
+    parser.add_argument('--layers', dest='num_layers', default=3, type=int)
 
     args = parser.parse_args()
-
-    #print('NOTE: SETTTING CHECKPOINT: ')
-    #args.checkpoint = os.path.join('vrp', '10', '12_59_47.350165' + os.path.sep)
-    #print(args.checkpoint)
-
-    if args.task == 'tsp':
-        train_tsp(args)
-    elif args.task == 'vrp':
-        train_vrp(args)
-    else:
-        raise ValueError('Task <%s> not understood'%args.task)
+    train_tsp(args)

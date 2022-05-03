@@ -10,3 +10,7 @@ flowchart TD
 R--> AC
 ```
 
+Input file
+
+grid_id,  latitude,  longitude, morning_amount, afternoon_amount, region_id, final_time, final_location
+
